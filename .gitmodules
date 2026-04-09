@@ -4,7 +4,7 @@
 	branch = robomimic
 [submodule "LIBERO"]
 	path = LIBERO
-	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+	url = git@github.com:weiweigu1998/LIBERO.git
 [submodule "robocasa"]
 	path = robocasa
 	url = https://github.com/robocasa/robocasa.git
