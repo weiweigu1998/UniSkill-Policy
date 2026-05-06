@@ -28,14 +28,30 @@ from robomimic.envs.wrappers import EnvWrapper
 from robomimic.algo import RolloutPolicy
 from tianshou.env import SubprocVectorEnv
 
-from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv
-from libero.lifelong.metric import raw_obs_to_tensor_obs
-from libero.libero.utils.time_utils import Timer
-from libero.libero.utils.video_utils import VideoWriter
-from libero.libero.benchmark import get_benchmark
-from libero.lifelong.datasets import (GroupedTaskDataset, SequenceVLDataset, get_dataset)
-from libero.lifelong.utils import (get_task_embs, safe_device, create_experiment_dir)
-from libero.libero import benchmark, get_libero_path
+# Optional LIBERO imports: these are only used by the LIBERO rollout / dataset
+# path. ManiSkill smoke tests never reach those code paths, so make the import
+# lazy and fail gracefully when LIBERO isn't installed.
+try:
+    from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv  # noqa: F811
+    from libero.lifelong.metric import raw_obs_to_tensor_obs
+    from libero.libero.utils.time_utils import Timer
+    from libero.libero.utils.video_utils import VideoWriter
+    from libero.libero.benchmark import get_benchmark
+    from libero.lifelong.datasets import (GroupedTaskDataset, SequenceVLDataset, get_dataset)
+    from libero.lifelong.utils import (get_task_embs, safe_device, create_experiment_dir)
+    from libero.libero import benchmark, get_libero_path
+    _LIBERO_AVAILABLE = True
+except ImportError:
+    OffScreenRenderEnv = None
+    raw_obs_to_tensor_obs = None
+    Timer = None
+    VideoWriter = None
+    get_benchmark = None
+    GroupedTaskDataset = SequenceVLDataset = get_dataset = None
+    get_task_embs = safe_device = create_experiment_dir = None
+    benchmark = None
+    get_libero_path = None
+    _LIBERO_AVAILABLE = False
 from omegaconf import OmegaConf
 import yaml
 from easydict import EasyDict
@@ -43,7 +59,10 @@ from torchvision import transforms
 from hydra import compose, initialize
 import hydra
 import pprint
-import robosuite.utils.transform_utils as T
+try:
+    import robosuite.utils.transform_utils as T  # noqa: F401  (unused here, used downstream)
+except ImportError:
+    T = None
 import sys
 
 def get_exp_dir(config, auto_remove_exp_dir=False):

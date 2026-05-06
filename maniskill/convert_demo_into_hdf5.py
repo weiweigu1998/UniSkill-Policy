@@ -2,17 +2,20 @@
 """Convert ActionBench ManiSkill demonstrations into the HDF5 format
 expected by UniSkill-Policy / robomimic training.
 
-Input layout (ActionBench sample_data):
+Input layout (LfO sample_data):
     <data_dir>/
-        0000/
+        training_trajectories/<task>/<traj_id>/
             <timestamp>.h5              # obs: sensor_data/base_camera/rgb, agent/qpos, extra/tcp_pose
             <timestamp>.json            # env metadata
             <timestamp>.state.*.h5      # flat obs + actions (pd_ee_delta_pose, 7-dim)
-        0001/
-            ...
+        video_demonstrations/<task>/...  # NOT used here (phase 1 only).
 
-Output:
-    <output_path>.hdf5 with structure:
+Output: **one HDF5 per task** at ``<output_dir>/<task>.hdf5``. Robomimic's skill
+loader keys on ``task_name = basename(hdf5)``, so the per-task HDF5 basename
+must match the ``<task>`` folder used by ``extract_skills.py`` when writing
+``<skill_dir>/<task>/demo_<i>/...``.
+
+    <output_dir>/<task>.hdf5
         data/
             demo_0/
                 obs/
@@ -28,10 +31,13 @@ Output:
             demo_1/
                 ...
 
+The ``demo_<i>`` index is assigned by sorted ``traj_id`` order within the task,
+matching the ordering ``extract_skills.py`` uses when writing skill .npy files.
+
 Usage:
     python maniskill/convert_demo_into_hdf5.py \
         --data-dir /path/to/sample_data \
-        --output datasets/action_bench/action_bench_demo.hdf5 \
+        --output-dir datasets/action_bench \
         --camera-key base_camera
 """
 
@@ -72,38 +78,65 @@ def quat_wxyz_to_axis_angle(quat_wxyz: np.ndarray) -> np.ndarray:
     return axis_angle
 
 
-def discover_demos(data_dir: str) -> list[dict]:
-    """Find all demo directories and pair their H5/JSON files."""
-    demos = []
+def _build_demo_record(traj_dir: Path) -> dict | None:
+    """Pair the main H5, state H5, and JSON inside one trajectory folder."""
+    main_h5_files = [
+        f for f in traj_dir.glob("*.h5") if ".state." not in f.name
+    ]
+    if not main_h5_files:
+        return None
+    state_h5_files = list(traj_dir.glob("*.state.pd_ee_delta_pose.*.h5"))
+    json_files = [
+        f for f in traj_dir.glob("*.json") if ".state." not in f.name
+    ]
+    return {
+        "name": traj_dir.name,
+        "main_h5": str(main_h5_files[0]),
+        "state_h5": str(state_h5_files[0]) if state_h5_files else None,
+        "json": str(json_files[0]) if json_files else None,
+    }
+
+
+def discover_tasks(data_dir: str, task_filter: str | None = None) -> list[tuple[str, list[dict]]]:
+    """Walk the LfO layout and return ``[(task_name, [demo_record, ...]), ...]``.
+
+    Falls back to the older flat layout (``<data_dir>/<traj_id>/``) so existing
+    flat-format datasets keep working. In the flat case the synthetic task name
+    is the basename of ``data_dir``.
+    """
     data_path = Path(data_dir)
+    training_root = data_path / "training_trajectories"
 
-    for demo_dir in sorted(data_path.iterdir()):
-        if not demo_dir.is_dir():
+    if training_root.is_dir():
+        tasks: list[tuple[str, list[dict]]] = []
+        for task_dir in sorted(training_root.iterdir()):
+            if not task_dir.is_dir():
+                continue
+            if task_filter is not None and task_dir.name != task_filter:
+                continue
+            demos: list[dict] = []
+            for traj_dir in sorted(task_dir.iterdir()):
+                if not traj_dir.is_dir():
+                    continue
+                rec = _build_demo_record(traj_dir)
+                if rec is not None:
+                    demos.append(rec)
+            if demos:
+                tasks.append((task_dir.name, demos))
+        return tasks
+
+    # Flat fallback.
+    demos: list[dict] = []
+    for traj_dir in sorted(data_path.iterdir()):
+        if not traj_dir.is_dir():
             continue
-
-        # Main H5 (obs with images)
-        main_h5_files = [
-            f for f in demo_dir.glob("*.h5") if ".state." not in f.name
-        ]
-        if not main_h5_files:
-            continue
-
-        # State H5 (flat obs + actions in pd_ee_delta_pose)
-        state_h5_files = list(demo_dir.glob("*.state.pd_ee_delta_pose.*.h5"))
-
-        # JSON metadata
-        json_files = [
-            f for f in demo_dir.glob("*.json") if ".state." not in f.name
-        ]
-
-        demos.append({
-            "name": demo_dir.name,
-            "main_h5": str(main_h5_files[0]),
-            "state_h5": str(state_h5_files[0]) if state_h5_files else None,
-            "json": str(json_files[0]) if json_files else None,
-        })
-
-    return demos
+        rec = _build_demo_record(traj_dir)
+        if rec is not None:
+            demos.append(rec)
+    if not demos:
+        return []
+    fallback_task = task_filter or data_path.name or "default"
+    return [(fallback_task, demos)]
 
 
 def extract_obs_from_demo(
@@ -219,11 +252,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--data-dir", type=str, required=True,
-        help="Root directory of ActionBench demo data.",
+        help="Root directory of LfO sample data (must contain training_trajectories/).",
     )
     p.add_argument(
-        "--output", type=str, required=True,
-        help="Output HDF5 file path.",
+        "--output-dir", type=str, required=True,
+        help="Output directory; one HDF5 per task is written as <output-dir>/<task>.hdf5.",
+    )
+    p.add_argument(
+        "--task", type=str, default=None,
+        help="Optional: only convert this single task name.",
     )
     p.add_argument(
         "--camera-key", type=str, default="base_camera",
@@ -236,23 +273,20 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
+def write_task_hdf5(
+    task_name: str,
+    demos: list[dict],
+    output_dir: str,
+    camera_key: str,
+    img_size: int,
+) -> tuple[str, int]:
+    """Write one ``<output_dir>/<task_name>.hdf5`` with all demos in this task."""
+    out_path = os.path.join(output_dir, f"{task_name}.hdf5")
+    os.makedirs(output_dir, exist_ok=True)
 
-    demos = discover_demos(args.data_dir)
-    if not demos:
-        print(f"No demos found in {args.data_dir}")
-        return
-
-    print(f"Found {len(demos)} demo(s)")
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-
-    with h5py.File(args.output, "w") as out:
+    total_samples = 0
+    with h5py.File(out_path, "w") as out:
         data_grp = out.create_group("data")
-
-        total_samples = 0
-
         for i, demo_info in enumerate(demos):
             demo_key = f"demo_{i}"
             print(f"  [{i}] {demo_info['name']} -> {demo_key}")
@@ -260,8 +294,8 @@ def main():
             obs_data = extract_obs_from_demo(
                 demo_info["main_h5"],
                 demo_info["state_h5"],
-                args.camera_key,
-                args.img_size,
+                camera_key,
+                img_size,
             )
 
             T = obs_data["num_samples"]
@@ -270,30 +304,47 @@ def main():
             demo_grp = data_grp.create_group(demo_key)
             demo_grp.attrs["num_samples"] = T
 
-            # Observations
             obs_grp = demo_grp.create_group("obs")
             for key in ("agentview_rgb", "eye_in_hand_rgb", "ee_pos", "ee_ori",
                         "joint_states", "gripper_states"):
                 obs_grp.create_dataset(key, data=obs_data[key])
 
-            # Actions
             demo_grp.create_dataset("actions", data=obs_data["actions"])
 
-            # Dones and rewards (all zeros, last step done)
             dones = np.zeros(T, dtype=np.uint8)
             dones[-1] = 1
             demo_grp.create_dataset("dones", data=dones)
             demo_grp.create_dataset("rewards", data=dones.copy())
 
-        # Data group attributes
         env_args_str = build_env_args(demos[0]["json"] if demos else None)
         data_grp.attrs["env_args"] = env_args_str
         data_grp.attrs["total"] = total_samples
         data_grp.attrs["num_demos"] = len(demos)
 
-    print(f"\nWrote {args.output}")
-    print(f"  Demos: {len(demos)}")
-    print(f"  Total samples: {total_samples}")
+    return out_path, total_samples
+
+
+def main():
+    args = parse_args()
+
+    tasks = discover_tasks(args.data_dir, args.task)
+    if not tasks:
+        print(f"No tasks found in {args.data_dir}")
+        return
+
+    print(f"Found {len(tasks)} task(s)")
+    for task_name, demos in tasks:
+        print(f"\nTask {task_name!r}: {len(demos)} demo(s)")
+        out_path, total_samples = write_task_hdf5(
+            task_name=task_name,
+            demos=demos,
+            output_dir=args.output_dir,
+            camera_key=args.camera_key,
+            img_size=args.img_size,
+        )
+        print(f"  Wrote {out_path}")
+        print(f"    Demos:  {len(demos)}")
+        print(f"    Frames: {total_samples}")
 
 
 if __name__ == "__main__":

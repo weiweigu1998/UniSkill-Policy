@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
 """Extract skill embeddings from ManiSkill demonstrations using a trained IDM.
 
-Reads the converted LIBERO-format HDF5 (from convert_demo_into_hdf5.py),
-runs the UniSkill IDM on consecutive frame pairs to produce per-timestep
-skill vectors, and saves them in the layout expected by robomimic training:
+Walks the LfO sample-data layout directly:
 
-    <skill_dir>/<task_name>/<demo_id>/base.npy     (T, 1, skill_dim)
+    <data_dir>/training_trajectories/<task>/<traj_id>/<timestamp>.h5
+
+For each robot trajectory we run the UniSkill IDM on consecutive frame pairs
+to produce per-timestep skill vectors, and save them in the layout expected by
+robomimic training:
+
+    <skill_dir>/<task>/demo_<i>/base.npy     (T, 1, skill_dim)
+
+The demo index ``i`` is assigned by sorted ``traj_id`` order within each task,
+matching how :mod:`convert_demo_into_hdf5` packs trajectories into per-task
+HDF5s. Robomimic's dataset loader keys on ``task_name = basename(hdf5)`` and
+demo_id from the HDF5, so as long as both scripts walk the trajectories in the
+same order the skill files line up.
 
 For skill augmentation, multiple noisy variants are also saved:
 
-    <skill_dir>/<task_name>/<demo_id>/aug_0.npy
-    <skill_dir>/<task_name>/<demo_id>/aug_1.npy
+    <skill_dir>/<task>/demo_<i>/aug_0.npy
+    <skill_dir>/<task>/demo_<i>/aug_1.npy
     ...
 
 Usage:
     python maniskill/extract_skills.py \
-        --hdf5 /workspace/data/maniskill_hdf5/action_bench_demo.hdf5 \
-        --idm-checkpoint /workspace/checkpoints/uniskill/UniSkill_final_weight/idm.pth \
-        --skill-dir /workspace/data/maniskill_hdf5/skills \
+        --data-dir /path/to/sample_data \
+        --idm-checkpoint /path/to/idm.pth \
+        --skill-dir /path/to/skills \
         --aug-num 5
 """
 
@@ -45,9 +55,13 @@ from dynamics.idm import IDM
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract skills from ManiSkill HDF5 demos")
-    p.add_argument("--hdf5", type=str, required=True,
-                    help="Path to the converted LIBERO-format HDF5 file.")
+    p = argparse.ArgumentParser(description="Extract skills from ManiSkill LfO demos")
+    p.add_argument("--data-dir", type=str, required=True,
+                    help="LfO sample-data root containing training_trajectories/<task>/<traj_id>/...")
+    p.add_argument("--task", type=str, default=None,
+                    help="Optional: only extract skills for this single task name.")
+    p.add_argument("--camera-key", type=str, default="base_camera",
+                    help="Camera under traj_0/obs/sensor_data/<camera>/rgb (default: base_camera).")
     p.add_argument("--idm-checkpoint", type=str, required=True,
                     help="Path to pretrained IDM weights (.pth).")
     p.add_argument("--skill-dir", type=str, required=True,
@@ -205,11 +219,52 @@ def extract_skills_from_frames(
     return skills_array.astype(np.float32)
 
 
+def discover_tasks(training_root: str, task_filter: str | None) -> list[tuple[str, list[str]]]:
+    """Return ``[(task_name, [traj_h5_path, ...]), ...]`` for the LfO layout.
+
+    Trajectories within each task are sorted by ``traj_id`` (the demo subfolder
+    name) so the skill index lines up with ``convert_demo_into_hdf5``'s
+    ``demo_<i>`` numbering inside the per-task HDF5.
+    """
+    tasks: list[tuple[str, list[str]]] = []
+    if not os.path.isdir(training_root):
+        return tasks
+    for task_entry in sorted(os.listdir(training_root)):
+        if task_filter is not None and task_entry != task_filter:
+            continue
+        task_dir = os.path.join(training_root, task_entry)
+        if not os.path.isdir(task_dir):
+            continue
+        h5_paths: list[str] = []
+        for traj_entry in sorted(os.listdir(task_dir)):
+            traj_dir = os.path.join(task_dir, traj_entry)
+            if not os.path.isdir(traj_dir):
+                continue
+            candidates = [
+                os.path.join(traj_dir, f)
+                for f in sorted(os.listdir(traj_dir))
+                if f.endswith(".h5") and ".state." not in f
+            ]
+            if candidates:
+                h5_paths.append(candidates[0])
+        if h5_paths:
+            tasks.append((task_entry, h5_paths))
+    return tasks
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
 
-    task_name = os.path.basename(os.path.splitext(args.hdf5)[0])
+    training_root = os.path.join(args.data_dir, "training_trajectories")
+    if not os.path.isdir(training_root):
+        # Tolerate flat layouts (older sample data) for backwards compat.
+        training_root = args.data_dir
+
+    tasks = discover_tasks(training_root, args.task)
+    if not tasks:
+        print(f"No tasks found under {training_root}")
+        return
 
     print(f"Loading IDM from {args.idm_checkpoint}...")
     idm = load_idm(args, device)
@@ -221,41 +276,36 @@ def main():
     depth_estimator.eval()
     depth_estimator.to(device)
 
-    print(f"Processing {args.hdf5}...")
-    with h5py.File(args.hdf5, "r") as f:
-        demo_keys = sorted(f["data"].keys())
+    rgb_key = f"traj_0/obs/sensor_data/{args.camera_key}/rgb"
+    for task_name, h5_paths in tasks:
+        print(f"\nTask {task_name!r}: {len(h5_paths)} trajector{'y' if len(h5_paths) == 1 else 'ies'}")
 
-        for demo_id in demo_keys:
-            demo_grp = f["data"][demo_id]
+        for demo_idx, h5_path in enumerate(h5_paths):
+            demo_id = f"demo_{demo_idx}"
 
-            # Load RGB frames from agentview
-            if "obs/agentview_rgb" in demo_grp:
-                frames = demo_grp["obs/agentview_rgb"][()]
-            else:
-                print(f"  {demo_id}: no agentview_rgb found, skipping")
-                continue
+            with h5py.File(h5_path, "r") as f:
+                if rgb_key not in f:
+                    print(f"  {demo_id}: missing {rgb_key} in {h5_path}, skipping")
+                    continue
+                frames = f[rgb_key][()]
 
-            print(f"  {demo_id}: {frames.shape[0]} frames, extracting skills...")
+            print(f"  {demo_id}: {frames.shape[0]} frames ({os.path.basename(h5_path)})")
 
             skills = extract_skills_from_frames(
-                frames, idm, depth_processor, depth_estimator, device, args
+                frames, idm, depth_processor, depth_estimator, device, args,
             )
 
-            # Save base skill
             out_dir = os.path.join(args.skill_dir, task_name, demo_id)
             os.makedirs(out_dir, exist_ok=True)
             np.save(os.path.join(out_dir, "base.npy"), skills)
-
-            # Save augmented variants
             for aug_idx in range(args.aug_num):
                 aug_skills = skills + args.aug_noise * np.random.randn(
                     *skills.shape
                 ).astype(np.float32)
                 np.save(os.path.join(out_dir, f"aug_{aug_idx}.npy"), aug_skills)
-
             print(f"    -> {out_dir} ({skills.shape})")
 
-    print(f"\nDone. Skills saved to {args.skill_dir}/{task_name}/")
+    print(f"\nDone. Skills saved under {args.skill_dir}/")
 
 
 if __name__ == "__main__":
