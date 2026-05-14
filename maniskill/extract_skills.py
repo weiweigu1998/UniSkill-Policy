@@ -12,7 +12,7 @@ robomimic training:
     <skill_dir>/<task>/demo_<i>/base.npy     (T, 1, skill_dim)
 
 The demo index ``i`` is assigned by sorted ``traj_id`` order within each task,
-matching how :mod:`convert_demo_into_hdf5` packs trajectories into per-task
+matching how :mod:`convert_lfo_to_robomimic` packs trajectories into per-task
 HDF5s. Robomimic's dataset loader keys on ``task_name = basename(hdf5)`` and
 demo_id from the HDF5, so as long as both scripts walk the trajectories in the
 same order the skill files line up.
@@ -223,7 +223,7 @@ def discover_tasks(training_root: str, task_filter: str | None) -> list[tuple[st
     """Return ``[(task_name, [traj_h5_path, ...]), ...]`` for the LfO layout.
 
     Trajectories within each task are sorted by ``traj_id`` (the demo subfolder
-    name) so the skill index lines up with ``convert_demo_into_hdf5``'s
+    name) so the skill index lines up with ``convert_lfo_to_robomimic``'s
     ``demo_<i>`` numbering inside the per-task HDF5.
     """
     tasks: list[tuple[str, list[str]]] = []

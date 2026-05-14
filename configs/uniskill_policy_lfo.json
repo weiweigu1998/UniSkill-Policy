@@ -1,7 +1,7 @@
 {
     "algo_name": "diffusion_policy",
     "experiment": {
-        "name": "uniskill_policy_maniskill",
+        "name": "uniskill_policy_lfo",
         "validate": false,
         "logging": {
             "terminal_output_to_txt": true,
@@ -21,6 +21,7 @@
         },
         "epoch_every_n_steps": 100,
         "validation_epoch_every_n_steps": 10,
+        "_comment_steps": "num_epochs * epoch_every_n_steps = 500 * 100 = 50000 total gradient steps",
         "env": null,
         "additional_envs": null,
         "render": false,
@@ -40,13 +41,13 @@
     "train": {
         "data": [
             {
-                "path": "/workspace/data/maniskill_hdf5/action_bench_demo.hdf5",
-                "horizon": 300,
+                "path": "/root/data/lfo_benchmark/robomimic_hdf5/bowl_in_plate.hdf5",
+                "horizon": 500,
                 "do_eval": false
             }
         ],
-        "output_dir": "/workspace/outputs/uniskill_policy",
-        "skill_dir": "/workspace/data/maniskill_hdf5/skills",
+        "output_dir": "/root/checkpoints/uniskill_policy_lfo",
+        "skill_dir": "/root/data/lfo_benchmark/robomimic_hdf5/skills",
         "skill_aug": true,
         "aug_num": 5,
         "num_data_workers": 16,
@@ -65,11 +66,11 @@
         "goal_mode": "skill",
         "cuda": true,
         "batch_size": 256,
-        "num_epochs": 1,
+        "num_epochs": 500,
         "seed": 0,
         "action_config": {
             "actions": {
-                "normalization": null
+                "normalization": "min_max"
             },
             "action_dict/abs_pos": {
                 "normalization": "min_max"
@@ -168,14 +169,14 @@
         "modalities": {
             "obs": {
                 "low_dim": [
-                    "ee_ori",
-                    "ee_pos",
                     "gripper_states",
                     "joint_states"
                 ],
                 "rgb": [
+                    "agentview_rgb",
                     "eye_in_hand_rgb",
-                    "agentview_rgb"
+                    "leftview_rgb",
+                    "rightview_rgb"
                 ],
                 "depth": [],
                 "scan": []
@@ -243,7 +244,7 @@
         ],
         "hp_values": [
             0,
-            "action_bench",
+            "lfo_benchmark",
             "abs_acs",
             {
                 "crop_height": 116,
