@@ -13,16 +13,19 @@ Input layout — produced by ``scripts/process_training_trajectories.py``:
         traj_0/{rewards,terminated,truncated,success}
         traj_0/env_states/...
 
-Output — one HDF5 per task, demo index by sorted demo-dir name:
+Output — one HDF5 per task, demo index by sorted demo-dir name. Default
+emits the **2-view** (front + wrist) configuration. Pass
+``--leftview-camera left_camera`` / ``--rightview-camera right_camera`` to
+add side views.
 
     <output-dir>/<task>.hdf5
         data/
             demo_<i>/
                 obs/
-                    agentview_rgb     (T-1, 128, 128, 3) uint8  # from base_camera
-                    eye_in_hand_rgb   (T-1, 128, 128, 3) uint8  # from hand_camera
-                    leftview_rgb      (T-1, 128, 128, 3) uint8  # from left_camera
-                    rightview_rgb     (T-1, 128, 128, 3) uint8  # from right_camera
+                    agentview_rgb     (T-1, 128, 128, 3) uint8  # from base_camera (front)
+                    eye_in_hand_rgb   (T-1, 128, 128, 3) uint8  # from hand_camera (wrist)
+                    [leftview_rgb     (T-1, 128, 128, 3) uint8] # optional, off by default
+                    [rightview_rgb    (T-1, 128, 128, 3) uint8] # optional, off by default
                     joint_states      (T-1, 7) float32
                     gripper_states    (T-1, 2) float32
                 actions               (T-1, 8) float32   # pd_joint_pos
@@ -35,10 +38,6 @@ Output — one HDF5 per task, demo index by sorted demo-dir name:
                 env_args       = JSON metadata for rollouts (best-effort; from <ts>.json)
         mask/
             train, valid                                 # 90/10 filter keys
-
-Pass ``--leftview-camera ""`` and/or ``--rightview-camera ""`` to drop those
-two extra views and fall back to the original 2-view (agentview + eye_in_hand)
-output.
 
 Lengths are aligned to action length (T-1) so obs/actions/dones/rewards all
 match — robomimic's SequenceDataset requires this.
@@ -74,8 +73,10 @@ import numpy as np
 
 DEFAULT_AGENTVIEW_CAMERA = "base_camera"
 DEFAULT_EYE_IN_HAND_CAMERA = "hand_camera"
-DEFAULT_LEFTVIEW_CAMERA = "left_camera"
-DEFAULT_RIGHTVIEW_CAMERA = "right_camera"
+# Empty defaults — left/right views are off by default. Pass --leftview-camera left_camera
+# (and similarly --rightview-camera right_camera) to enable them.
+DEFAULT_LEFTVIEW_CAMERA = ""
+DEFAULT_RIGHTVIEW_CAMERA = ""
 
 
 def _resize_uint8(rgb: np.ndarray, size: int) -> np.ndarray:

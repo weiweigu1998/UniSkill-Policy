@@ -174,9 +174,7 @@
                 ],
                 "rgb": [
                     "agentview_rgb",
-                    "eye_in_hand_rgb",
-                    "leftview_rgb",
-                    "rightview_rgb"
+                    "eye_in_hand_rgb"
                 ],
                 "depth": [],
                 "scan": []
