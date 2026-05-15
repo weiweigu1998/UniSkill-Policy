@@ -165,8 +165,11 @@ def main() -> None:
             frames = load_demo_frames(args.samples_root, sample_idxs, args.camera_key)
             T = frames.shape[0]
 
-            # Core extraction: unmodified upstream UniSkill code.
-            skills_2d = extract_latents_for_demo(
+            # Core extraction: unmodified upstream UniSkill code. The IDM's
+            # skill output already carries the singleton sequence dim, so this
+            # returns (T - interval, 1, skill_dim) for a non-empty demo (and
+            # the degenerate (0, skill_dim) for a too-short one).
+            skills = extract_latents_for_demo(
                 frames,
                 idm=idm,
                 idm_resolution=args.idm_resolution,
@@ -178,16 +181,19 @@ def main() -> None:
                 skill_dim=skill_dim,
                 prefetch_workers=args.prefetch_workers,
                 use_amp=args.amp,
-            )  # (T - interval, skill_dim)
+            )
 
-            # Pad to T (repeat the last skill) and add the singleton sequence
-            # dim that robomimic's goal_mode="skill" loader indexes as [:, 0, :].
-            if skills_2d.shape[0] == 0:
-                skills_2d = np.zeros((T, skill_dim), dtype=np.float32)
-            elif skills_2d.shape[0] < T:
-                pad = np.tile(skills_2d[-1:], (T - skills_2d.shape[0], 1))
-                skills_2d = np.concatenate([skills_2d, pad], axis=0)
-            skills = skills_2d[:, None, :].astype(np.float32)  # (T, 1, skill_dim)
+            # Normalize the upstream empty-case shape, then pad to T by
+            # repeating the last skill. Final layout (T, 1, skill_dim) is what
+            # robomimic's goal_mode="skill" loader indexes as [:, 0, :].
+            if skills.ndim == 2:  # upstream empty-demo case → (0, skill_dim)
+                skills = skills.reshape(0, 1, skills.shape[-1])
+            if skills.shape[0] == 0:
+                skills = np.zeros((T, 1, skill_dim), dtype=np.float32)
+            elif skills.shape[0] < T:
+                pad = np.tile(skills[-1:], (T - skills.shape[0], 1, 1))
+                skills = np.concatenate([skills, pad], axis=0)
+            skills = skills.astype(np.float32)  # (T, 1, skill_dim)
 
             os.makedirs(out_dir, exist_ok=True)
             np.save(os.path.join(out_dir, "base.npy"), skills)
