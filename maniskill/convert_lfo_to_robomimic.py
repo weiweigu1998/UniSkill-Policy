@@ -236,6 +236,13 @@ def _write_task_hdf5(
             demo_ids.append(demo_grp.name.split("/")[-1])
 
         data_grp.attrs["total"] = total_samples
+        # robomimic's get_env_metadata_from_dataset unconditionally reads
+        # data.attrs["env_args"]; rollouts are disabled (out of scope) so the
+        # contents are unused, but the attribute must exist or train() raises
+        # KeyError before training starts.
+        data_grp.attrs["env_args"] = json.dumps(
+            {"env_name": task, "type": "maniskill", "env_kwargs": {}}
+        )
 
         # 90/10 deterministic mask split (rng seeded by task name + seed; mask
         # to 64-bit non-negative since numpy's default_rng rejects negatives).
