@@ -92,16 +92,26 @@ def _resize_uint8(rgb: np.ndarray, size: int) -> np.ndarray:
     return out
 
 
-def _discover_demos(
-    samples_root: Path, task_filter: str | None
-) -> list[tuple[str, list[tuple[str, list[int]]]]]:
-    """Group sample idxs by ``(task, demo_id)`` from ``meta/index.jsonl``.
+#: ManiSkill articulation row layout: [root_pose(7), root_lin_vel(3),
+#: root_ang_vel(3), qpos(N), qvel(N)]. For the 9-DoF panda this is
+#: 13 + 9 + 9 = 31 columns; qpos lives at offset 13 with length 9.
+_ARTICULATION_QPOS_OFFSET = 13
+_ARTICULATION_QPOS_LEN = 9
 
-    Returns ``[(task, [(demo_id, [sample_idx sorted by t, ...]), ...]), ...]``
-    with ``demo_id`` keys sorted — identical to
-    ``extract_uniskill_robot_skill.discover_demos`` so the per-task HDF5's
-    ``demo_<i>`` ordering lines up with the skill directory.
+
+def _discover_demos(
+    samples_root: Path, raw_root: Path, task_filter: str | None
+) -> list[tuple[str, list[tuple[str, list[int], str, Path]]]]:
+    """Group sample idxs by ``(task, demo_id)`` from ``meta/index.jsonl`` and
+    attach the demo's raw-trajectory location.
+
+    Returns ``[(task, [(demo_id, [sample_idx sorted by t, ...], h5_path,
+    demo_dir), ...]), ...]`` with ``demo_id`` keys sorted. ``h5_path`` /
+    ``demo_dir`` point into ``raw_training_trajectories/<task>/<demo_id>/`` so
+    :func:`_convert_one_demo` can fill in the trailing ``action_horizon``
+    timesteps that the pi05 trim drops from the pkls.
     """
+    import glob
     index_path = samples_root / "meta" / "index.jsonl"
     if not index_path.is_file():
         raise FileNotFoundError(
@@ -118,14 +128,22 @@ def _discover_demos(
             e = json.loads(line)
             groups[e["task"]][e["demo_id"]].append((int(e["t"]), int(e["idx"])))
 
-    tasks: list[tuple[str, list[tuple[str, list[int]]]]] = []
+    tasks: list[tuple[str, list[tuple[str, list[int], str, Path]]]] = []
     for task in sorted(groups):
         if task_filter is not None and task != task_filter:
             continue
-        demos = [
-            (demo_id, [idx for _t, idx in sorted(groups[task][demo_id])])
-            for demo_id in sorted(groups[task])
-        ]
+        demos: list[tuple[str, list[int], str, Path]] = []
+        for demo_id in sorted(groups[task]):
+            sample_idxs = [idx for _t, idx in sorted(groups[task][demo_id])]
+            demo_dir = raw_root / task / demo_id
+            h5s = sorted(glob.glob(str(demo_dir / "*.h5")))
+            if not h5s:
+                print(f"  warn: no h5 for {task}/{demo_id} under {demo_dir}; "
+                      "writing pkl-trimmed length only")
+                h5_path = ""
+            else:
+                h5_path = h5s[0]
+            demos.append((demo_id, sample_idxs, h5_path, demo_dir))
         if demos:
             tasks.append((task, demos))
     return tasks
@@ -137,6 +155,8 @@ def _convert_one_demo(
     *,
     camera_map: dict,
     image_size: int,
+    h5_path: str = "",
+    demo_dir: Path | None = None,
 ) -> dict:
     """Read one demo's per-sample pkls, return arrays ready to write under ``demo_<i>``.
 
@@ -144,6 +164,13 @@ def _convert_one_demo(
         camera_map: Mapping from output obs key (e.g. ``"agentview_rgb"``) to
             the source camera name stored as ``observation/<name>`` in each pkl.
         image_size: target H/W for the cv2.resize downsample.
+        h5_path: optional raw-trajectory ``*.h5`` path. When given alongside
+            ``demo_dir``, the converter fills in the trailing
+            ``T_act - len(sample_idxs)`` timesteps that the pi05 horizon trim
+            drops — actions + qpos from the h5, images from the demo's mp4s —
+            so the output HDF5 covers the *full* trajectory (length ``T_act``).
+        demo_dir: ``raw_training_trajectories/<task>/<demo>/`` (needed to
+            locate ``<src_cam>.mp4`` for the trailing-frame fill-in).
     """
     data_dir = samples_root / "data"
     rgb_acc: dict[str, list[np.ndarray]] = {k: [] for k in camera_map}
@@ -163,7 +190,54 @@ def _convert_one_demo(
         # *at* timestep t — what robomimic wants per step — is window row 0.
         action_acc.append(np.asarray(s["actions"], dtype=np.float32)[0])
 
-    T = len(sample_idxs)
+    # Fill in the trailing timesteps that the pi05 horizon trim drops from
+    # the pkls (UniSkill-Policy is single-step; pi05 chunk size is irrelevant).
+    if h5_path and demo_dir is not None:
+        with h5py.File(h5_path, "r") as f:
+            T_act = int(f["traj_0/actions"].shape[0])
+            extra = T_act - len(sample_idxs)
+            if extra > 0:
+                tail_actions = np.asarray(
+                    f["traj_0/actions"][len(sample_idxs):T_act], dtype=np.float32)
+                art_keys = list(f["traj_0/env_states/articulations"].keys())
+                robot_key = next((k for k in art_keys if "panda" in k.lower()),
+                                 art_keys[0])
+                art = np.asarray(
+                    f[f"traj_0/env_states/articulations/{robot_key}"][
+                        len(sample_idxs):T_act], dtype=np.float32)
+                tail_qpos = art[:, _ARTICULATION_QPOS_OFFSET :
+                                _ARTICULATION_QPOS_OFFSET + _ARTICULATION_QPOS_LEN]
+                for row in range(extra):
+                    action_acc.append(tail_actions[row])
+                    joint_acc.append(tail_qpos[row, :7])
+                    gripper_acc.append(tail_qpos[row, 7:9])
+            else:
+                extra = 0
+        # Pull the trailing camera frames from the per-camera mp4s (frame index
+        # == timestep, verified: cam_frames == T_act). Raw mp4 frames are
+        # 512x512 while the existing pkl frames are 224x224 (preprocessed in
+        # process_training_trajectories.py); resize the new frames to match
+        # before stacking so np.stack accepts the concatenation.
+        if extra > 0:
+            from decord import VideoReader, cpu
+            pkl_shape = rgb_acc[next(iter(camera_map))][0].shape  # (Hpkl, Wpkl, 3)
+            tgt_h, tgt_w = pkl_shape[0], pkl_shape[1]
+            tail_idxs = list(range(len(sample_idxs), len(sample_idxs) + extra))
+            for out_key, src_cam in camera_map.items():
+                mp4_path = demo_dir / f"{src_cam}.mp4"
+                if not mp4_path.is_file():
+                    raise FileNotFoundError(
+                        f"trailing-frame fill needs {mp4_path} (found h5 only)")
+                vr = VideoReader(str(mp4_path), ctx=cpu(0))
+                idxs_in_vr = [min(t, len(vr) - 1) for t in tail_idxs]
+                frames = vr.get_batch(idxs_in_vr).asnumpy()  # (extra, H, W, 3)
+                for fr in frames:
+                    if (fr.shape[0], fr.shape[1]) != (tgt_h, tgt_w):
+                        fr = cv2.resize(fr, (tgt_w, tgt_h),
+                                        interpolation=cv2.INTER_AREA)
+                    rgb_acc[out_key].append(fr)
+
+    T = len(action_acc)
     out: dict = {
         "obs/joint_states": np.stack(joint_acc, axis=0).astype(np.float32),
         "obs/gripper_states": np.stack(gripper_acc, axis=0).astype(np.float32),
@@ -183,7 +257,7 @@ def _convert_one_demo(
 def _write_task_hdf5(
     task: str,
     samples_root: Path,
-    demos: list[tuple[str, list[int]]],
+    demos: list[tuple[str, list[int], str, Path]],
     out_path: Path,
     *,
     camera_map: dict,
@@ -206,13 +280,15 @@ def _write_task_hdf5(
     with h5py.File(tmp_path, "w") as out:
         data_grp = out.create_group("data")
         compression_kw = {"compression": compression} if compression else {}
-        for i, (demo_id, sample_idxs) in enumerate(demos):
+        for i, (demo_id, sample_idxs, h5_path, demo_dir) in enumerate(demos):
             try:
                 arrays = _convert_one_demo(
                     samples_root,
                     sample_idxs,
                     camera_map=camera_map,
                     image_size=image_size,
+                    h5_path=h5_path,
+                    demo_dir=demo_dir,
                 )
             except (KeyError, OSError, ValueError) as e:
                 print(f"  skip {task}/{demo_id}: {e}")
@@ -284,6 +360,14 @@ def main() -> None:
              "+ meta/index.jsonl (default: postprocessed_robot_trajectories).",
     )
     p.add_argument(
+        "--raw-subdir",
+        default="raw_training_trajectories",
+        help="Subdir under data-dir holding the raw per-demo trajectory "
+             "(<task>/<demo>/*.h5 + per-camera mp4s). Used to fill in the "
+             "trailing T_act - pkl_count timesteps the pi05 horizon trim drops "
+             "(default: raw_training_trajectories).",
+    )
+    p.add_argument(
         "--task",
         default=None,
         help="If set, only convert this task. Otherwise iterate all tasks in index.jsonl.",
@@ -344,11 +428,14 @@ def main() -> None:
     data_dir = Path(os.path.expanduser(args.data_dir)).resolve()
     out_dir = Path(os.path.expanduser(args.output_dir)).resolve()
     src_root = data_dir / args.input_subdir
+    raw_root = data_dir / args.raw_subdir
     if not src_root.is_dir():
         raise FileNotFoundError(f"{src_root} not found")
+    if not raw_root.is_dir():
+        print(f"  warn: {raw_root} not found — trailing-frame fill-in disabled")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = _discover_demos(src_root, args.task)
+    tasks = _discover_demos(src_root, raw_root, args.task)
     if not tasks:
         raise SystemExit(f"No demos found under {src_root}")
 
