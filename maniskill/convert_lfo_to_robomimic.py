@@ -100,19 +100,23 @@ _ARTICULATION_QPOS_LEN = 9
 
 
 def _discover_demos(
-    samples_root: Path, raw_root: Path, task_filter: str | None
+    samples_root: Path, raw_root: Path, task_filter: str | None,
+    index_filename: str = "index.jsonl",
 ) -> list[tuple[str, list[tuple[str, list[int], str, Path]]]]:
-    """Group sample idxs by ``(task, demo_id)`` from ``meta/index.jsonl`` and
-    attach the demo's raw-trajectory location.
+    """Group sample idxs by ``(task, demo_id)`` from ``meta/<index_filename>``
+    and attach the demo's raw-trajectory location.
 
     Returns ``[(task, [(demo_id, [sample_idx sorted by t, ...], h5_path,
     demo_dir), ...]), ...]`` with ``demo_id`` keys sorted. ``h5_path`` /
     ``demo_dir`` point into ``raw_training_trajectories/<task>/<demo_id>/`` so
     :func:`_convert_one_demo` can fill in the trailing ``action_horizon``
-    timesteps that the pi05 trim drops from the pkls.
+    timesteps that the pi05 trim drops from the pkls when the chosen index
+    only covers pi05's trimmed range. (When called with
+    ``index_filename="full_index.jsonl"`` the index already covers the full
+    T_act, so the fill-in is a no-op.)
     """
     import glob
-    index_path = samples_root / "meta" / "index.jsonl"
+    index_path = samples_root / "meta" / index_filename
     if not index_path.is_file():
         raise FileNotFoundError(
             f"Expected {index_path}. Run scripts/process_training_trajectories.py first."
@@ -368,6 +372,13 @@ def main() -> None:
              "(default: raw_training_trajectories).",
     )
     p.add_argument(
+        "--index-filename",
+        default="index.jsonl",
+        help="Filename under <input-subdir>/meta/ to read the sample index "
+             "from. Default 'index.jsonl' is pi05's pi05-horizon-trimmed range; "
+             "pass 'full_index.jsonl' to read the post-extend full T_act range.",
+    )
+    p.add_argument(
         "--task",
         default=None,
         help="If set, only convert this task. Otherwise iterate all tasks in index.jsonl.",
@@ -435,7 +446,8 @@ def main() -> None:
         print(f"  warn: {raw_root} not found — trailing-frame fill-in disabled")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = _discover_demos(src_root, raw_root, args.task)
+    tasks = _discover_demos(src_root, raw_root, args.task,
+                            index_filename=args.index_filename)
     if not tasks:
         raise SystemExit(f"No demos found under {src_root}")
 
