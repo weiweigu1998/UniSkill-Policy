@@ -139,14 +139,32 @@ def _discover_demos(
         demos: list[tuple[str, list[int], str, Path]] = []
         for demo_id in sorted(groups[task]):
             sample_idxs = [idx for _t, idx in sorted(groups[task][demo_id])]
-            demo_dir = raw_root / task / demo_id
-            h5s = sorted(glob.glob(str(demo_dir / "*.h5")))
-            if not h5s:
-                print(f"  warn: no h5 for {task}/{demo_id} under {demo_dir}; "
+            # raw_training_trajectories/ now has a per-bucket layer
+            # (<bucket>/<task>/<demo_id>/). Search both, without_distraction
+            # first since legacy demos were moved there.
+            demo_dir = None
+            h5_path = ""
+            for bucket in ("without_distraction", "with_distraction"):
+                cand = raw_root / bucket / task / demo_id
+                if cand.is_dir():
+                    demo_dir = cand
+                    h5s = sorted(glob.glob(str(cand / "*.h5")))
+                    if h5s:
+                        h5_path = h5s[0]
+                    break
+            if demo_dir is None:
+                # Fall back to the legacy flat layout so an unmigrated
+                # ``raw_training_trajectories/<task>/<demo_id>/`` tree still
+                # converts (the trailing-frame fill-in just becomes a no-op
+                # if the h5 is missing).
+                demo_dir = raw_root / task / demo_id
+                if demo_dir.is_dir():
+                    h5s = sorted(glob.glob(str(demo_dir / "*.h5")))
+                    if h5s:
+                        h5_path = h5s[0]
+            if not h5_path:
+                print(f"  warn: no h5 for {task}/{demo_id} under {raw_root}; "
                       "writing pkl-trimmed length only")
-                h5_path = ""
-            else:
-                h5_path = h5s[0]
             demos.append((demo_id, sample_idxs, h5_path, demo_dir))
         if demos:
             tasks.append((task, demos))
