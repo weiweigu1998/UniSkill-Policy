@@ -99,21 +99,41 @@ _ARTICULATION_QPOS_OFFSET = 13
 _ARTICULATION_QPOS_LEN = 9
 
 
+#: Buckets that skip the per-task subdir layer in the output HDF5 tree
+#: (mirrors process_training_trajectories.py::_FLAT_BUCKETS). The HDF5 for
+#: a flat bucket is written as ``<output>/<bucket>.hdf5`` rather than
+#: ``<output>/<bucket>/<task>.hdf5``.
+_FLAT_OUTPUT_BUCKETS = frozenset({"task_sequence"})
+
+
+def _entry_bucket(entry: dict) -> str:
+    """Resolve the bucket for an index entry. New entries carry an explicit
+    ``"bucket"`` field; legacy entries are inferred (``" and "`` in task ⇒
+    task_sequence; otherwise without_distraction)."""
+    b = entry.get("bucket")
+    if b:
+        return b
+    if " and " in entry.get("task", ""):
+        return "task_sequence"
+    return "without_distraction"
+
+
 def _discover_demos(
     samples_root: Path, raw_root: Path, task_filter: str | None,
     index_filename: str = "index.jsonl",
-) -> list[tuple[str, list[tuple[str, list[int], str, Path]]]]:
-    """Group sample idxs by ``(task, demo_id)`` from ``meta/<index_filename>``
-    and attach the demo's raw-trajectory location.
+) -> list[tuple[str, str, list[tuple[str, list[int], str, Path]]]]:
+    """Group sample idxs by ``(bucket, task, demo_id)`` from
+    ``meta/<index_filename>`` and attach the demo's raw-trajectory location.
 
-    Returns ``[(task, [(demo_id, [sample_idx sorted by t, ...], h5_path,
-    demo_dir), ...]), ...]`` with ``demo_id`` keys sorted. ``h5_path`` /
-    ``demo_dir`` point into ``raw_training_trajectories/<task>/<demo_id>/`` so
-    :func:`_convert_one_demo` can fill in the trailing ``action_horizon``
-    timesteps that the pi05 trim drops from the pkls when the chosen index
-    only covers pi05's trimmed range. (When called with
-    ``index_filename="full_index.jsonl"`` the index already covers the full
-    T_act, so the fill-in is a no-op.)
+    Returns ``[(bucket, task, [(demo_id, [sample_idx sorted by t, ...],
+    h5_path, demo_dir), ...]), ...]``. For flat buckets (``task_sequence``)
+    the per-demo natural-language task label is dropped in favour of the
+    bucket name, so all demos in the bucket land in a single output HDF5.
+
+    ``h5_path`` / ``demo_dir`` point into
+    ``raw_training_trajectories/<bucket>/[<task>/]<demo_id>/`` so the
+    trailing-frame fill-in can read raw h5/mp4s when the index is the
+    pi05-trimmed range. (With ``full_index.jsonl`` the fill-in is a no-op.)
     """
     import glob
     index_path = samples_root / "meta" / index_filename
@@ -121,7 +141,8 @@ def _discover_demos(
         raise FileNotFoundError(
             f"Expected {index_path}. Run scripts/process_training_trajectories.py first."
         )
-    groups: dict[str, dict[str, list[tuple[int, int]]]] = defaultdict(
+    # Key: (bucket, task). For flat buckets we collapse task -> bucket.
+    groups: dict[tuple[str, str], dict[str, list[tuple[int, int]]]] = defaultdict(
         lambda: defaultdict(list)
     )
     with open(index_path) as f:
@@ -130,52 +151,46 @@ def _discover_demos(
             if not line:
                 continue
             e = json.loads(line)
-            # Group task_sequence demos under a single "task_sequence" key so
-            # they end up in one task_sequence.hdf5 instead of one HDF5 per
-            # unique sequence variant. Identified by " and " in the label (the
-            # joined natural-language form written by
-            # process_training_trajectories.py); existing single-task names are
-            # all underscore-separated so this is unambiguous.
-            task = "task_sequence" if " and " in e["task"] else e["task"]
-            groups[task][e["demo_id"]].append((int(e["t"]), int(e["idx"])))
+            bucket = _entry_bucket(e)
+            task = bucket if bucket in _FLAT_OUTPUT_BUCKETS else e["task"]
+            groups[(bucket, task)][e["demo_id"]].append((int(e["t"]), int(e["idx"])))
 
-    tasks: list[tuple[str, list[tuple[str, list[int], str, Path]]]] = []
-    for task in sorted(groups):
+    out: list[tuple[str, str, list[tuple[str, list[int], str, Path]]]] = []
+    for (bucket, task) in sorted(groups):
         if task_filter is not None and task != task_filter:
             continue
         demos: list[tuple[str, list[int], str, Path]] = []
-        for demo_id in sorted(groups[task]):
-            sample_idxs = [idx for _t, idx in sorted(groups[task][demo_id])]
-            # raw_training_trajectories/ now has a per-bucket layer
-            # (<bucket>/<task>/<demo_id>/). Search both, without_distraction
-            # first since legacy demos were moved there.
-            demo_dir = None
-            h5_path = ""
-            for bucket in ("without_distraction", "with_distraction"):
+        for demo_id in sorted(groups[(bucket, task)]):
+            sample_idxs = [idx for _t, idx in sorted(groups[(bucket, task)][demo_id])]
+            # Locate the raw trajectory: <raw_root>/<bucket>/[<task>/]<demo_id>/.
+            # For flat buckets there is no <task> layer.
+            if bucket in _FLAT_OUTPUT_BUCKETS:
+                cand = raw_root / bucket / demo_id
+            else:
                 cand = raw_root / bucket / task / demo_id
-                if cand.is_dir():
-                    demo_dir = cand
-                    h5s = sorted(glob.glob(str(cand / "*.h5")))
-                    if h5s:
-                        h5_path = h5s[0]
-                    break
-            if demo_dir is None:
-                # Fall back to the legacy flat layout so an unmigrated
-                # ``raw_training_trajectories/<task>/<demo_id>/`` tree still
-                # converts (the trailing-frame fill-in just becomes a no-op
-                # if the h5 is missing).
-                demo_dir = raw_root / task / demo_id
-                if demo_dir.is_dir():
-                    h5s = sorted(glob.glob(str(demo_dir / "*.h5")))
+            demo_dir = cand if cand.is_dir() else None
+            h5_path = ""
+            if demo_dir is not None:
+                h5s = sorted(glob.glob(str(demo_dir / "*.h5")))
+                if h5s:
+                    h5_path = h5s[0]
+            else:
+                # Fall back to the legacy flat layout (pre-bucket-migration)
+                # in case an unmigrated repo is consulted; trailing-frame
+                # fill-in just becomes a no-op if the h5 is missing.
+                legacy = raw_root / task / demo_id
+                if legacy.is_dir():
+                    demo_dir = legacy
+                    h5s = sorted(glob.glob(str(legacy / "*.h5")))
                     if h5s:
                         h5_path = h5s[0]
             if not h5_path:
-                print(f"  warn: no h5 for {task}/{demo_id} under {raw_root}; "
+                print(f"  warn: no h5 for {bucket}/{task}/{demo_id} under {raw_root}; "
                       "writing pkl-trimmed length only")
             demos.append((demo_id, sample_idxs, h5_path, demo_dir))
         if demos:
-            tasks.append((task, demos))
-    return tasks
+            out.append((bucket, task, demos))
+    return out
 
 
 def _convert_one_demo(
@@ -471,9 +486,9 @@ def main() -> None:
         print(f"  warn: {raw_root} not found — trailing-frame fill-in disabled")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = _discover_demos(src_root, raw_root, args.task,
-                            index_filename=args.index_filename)
-    if not tasks:
+    groups = _discover_demos(src_root, raw_root, args.task,
+                             index_filename=args.index_filename)
+    if not groups:
         raise SystemExit(f"No demos found under {src_root}")
 
     compression = None if args.compression == "none" else args.compression
@@ -491,11 +506,16 @@ def main() -> None:
     if not camera_map:
         raise SystemExit("At least one camera must be enabled.")
 
-    print(f"converting {len(tasks)} task(s) → {out_dir}  (rgb keys: {list(camera_map)})")
-    for task, demos in tasks:
-        out_path = out_dir / f"{task}.hdf5"
+    print(f"converting {len(groups)} (bucket, task) group(s) → {out_dir}  (rgb keys: {list(camera_map)})")
+    for bucket, task, demos in groups:
+        # Per-task buckets:  <out_dir>/<bucket>/<task>.hdf5
+        # Flat buckets:      <out_dir>/<bucket>.hdf5   (single HDF5 for the whole bucket)
+        if bucket in _FLAT_OUTPUT_BUCKETS:
+            out_path = out_dir / f"{bucket}.hdf5"
+        else:
+            out_path = out_dir / bucket / f"{task}.hdf5"
         if out_path.exists() and not args.overwrite:
-            print(f"  skip {task}: {out_path} already exists (pass --overwrite to redo)")
+            print(f"  skip {bucket}/{task}: {out_path} already exists (pass --overwrite to redo)")
             continue
         n, total = _write_task_hdf5(
             task,
@@ -508,7 +528,7 @@ def main() -> None:
             seed=args.seed,
             compression=compression,
         )
-        print(f"  {task}: wrote {n} demos / {total} samples → {out_path}")
+        print(f"  {bucket}/{task}: wrote {n} demos / {total} samples → {out_path}")
 
 
 if __name__ == "__main__":
