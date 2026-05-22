@@ -130,7 +130,14 @@ def _discover_demos(
             if not line:
                 continue
             e = json.loads(line)
-            groups[e["task"]][e["demo_id"]].append((int(e["t"]), int(e["idx"])))
+            # Group task_sequence demos under a single "task_sequence" key so
+            # they end up in one task_sequence.hdf5 instead of one HDF5 per
+            # unique sequence variant. Identified by " and " in the label (the
+            # joined natural-language form written by
+            # process_training_trajectories.py); existing single-task names are
+            # all underscore-separated so this is unambiguous.
+            task = "task_sequence" if " and " in e["task"] else e["task"]
+            groups[task][e["demo_id"]].append((int(e["t"]), int(e["idx"])))
 
     tasks: list[tuple[str, list[tuple[str, list[int], str, Path]]]] = []
     for task in sorted(groups):
